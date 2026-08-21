@@ -1,3 +1,7 @@
+// The library exposes a curated facade. Without the CLI, shared modules retain
+// private helpers that are only reached by CLI workflows.
+#![cfg_attr(not(feature = "cli"), allow(dead_code))]
+
 // Core modules
 mod app_config;
 mod claude_mcp;
@@ -41,7 +45,12 @@ mod usage_script;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+// Localized validation text is also used by the library-only build.
+#[path = "cli/i18n.rs"]
+pub mod i18n;
+
 // CLI module
+#[cfg(feature = "cli")]
 pub mod cli;
 
 // Public exports
@@ -70,12 +79,13 @@ pub use mcp::{
 pub use provider::{Provider, ProviderMeta, UsageScript};
 pub use proxy::{ProxyConfig, ProxyServerInfo, ProxyStatus};
 pub use services::{
-    reapply_current_codex_official_live, AuthService, ConfigService, CredentialStatus,
-    EndpointLatency, ExtraUsage, HealthStatus, ImportSkillSelection, ManagedAuthAccount,
-    ManagedAuthDeviceCodeResponse, ManagedAuthStatus, McpService, PromptService, ProviderService,
-    ProxyService, QuotaTier, S3RemoteInfo, S3SyncService, S3SyncSummary, SkillService,
-    SpeedtestService, StreamCheckConfig, StreamCheckResult, StreamCheckService, SubscriptionQuota,
-    SyncDecision, WebDavSyncService, WebDavSyncSummary,
+    reapply_current_codex_official_live, AuthCompletionResponse, AuthService, AuthStartResponse,
+    BrowserAuthStart, ConfigService, CredentialStatus, EndpointLatency, ExtraUsage, HealthStatus,
+    ImportSkillSelection, ManagedAuthAccount, ManagedAuthDeviceCodeResponse, ManagedAuthStatus,
+    McpService, PromptService, ProviderService, ProxyService, QuotaTier, S3RemoteInfo,
+    S3SyncService, S3SyncSummary, SkillService, SpeedtestService, StreamCheckConfig,
+    StreamCheckResult, StreamCheckService, SubscriptionQuota, SyncDecision, WebDavSyncService,
+    WebDavSyncSummary,
 };
 pub use settings::{
     get_enable_claude_plugin_integration, get_s3_sync_settings, get_skip_claude_onboarding,

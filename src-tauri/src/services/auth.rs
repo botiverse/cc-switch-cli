@@ -1,7 +1,11 @@
 use crate::proxy::providers::codex_oauth_auth::CodexOAuthError;
 use crate::services::CodexOAuthService;
 
-const AUTH_PROVIDER_CODEX_OAUTH: &str = "codex_oauth";
+pub mod claude;
+pub mod codex;
+
+use claude::PROVIDER as AUTH_PROVIDER_CLAUDE_OAUTH;
+use codex::PROVIDER as AUTH_PROVIDER_CODEX_OAUTH;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ManagedAuthAccount {
@@ -32,53 +36,93 @@ pub struct ManagedAuthDeviceCodeResponse {
     pub interval: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct BrowserAuthStart {
+    pub provider: String,
+    pub authorization_url: String,
+    pub state: String,
+    pub redirect_uri: String,
+    pub expires_in: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "flow", rename_all = "snake_case")]
+pub enum AuthStartResponse {
+    DeviceCode(ManagedAuthDeviceCodeResponse),
+    Browser(BrowserAuthStart),
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AuthCompletionResponse {
+    pub provider: String,
+    pub account_id: String,
+    pub login: Option<String>,
+    pub organization_id: Option<String>,
+    pub is_default: bool,
+}
+
+fn unsupported(provider: &str, operation: &str) -> String {
+    format!("Auth provider '{provider}' does not support {operation}")
+}
+
 fn ensure_auth_provider(auth_provider: &str) -> Result<&'static str, String> {
     match auth_provider {
         AUTH_PROVIDER_CODEX_OAUTH => Ok(AUTH_PROVIDER_CODEX_OAUTH),
+        AUTH_PROVIDER_CLAUDE_OAUTH => Ok(AUTH_PROVIDER_CLAUDE_OAUTH),
         _ => Err(format!("Unsupported auth provider: {auth_provider}")),
-    }
-}
-
-fn map_account(
-    provider: &str,
-    account: crate::proxy::providers::codex_oauth_auth::ManagedAuthAccount,
-    default_account_id: Option<&str>,
-) -> ManagedAuthAccount {
-    ManagedAuthAccount {
-        is_default: default_account_id == Some(account.id.as_str()),
-        id: account.id,
-        provider: provider.to_string(),
-        login: account.login,
-        avatar_url: account.avatar_url,
-        authenticated_at: account.authenticated_at,
-    }
-}
-
-fn map_device_code_response(
-    provider: &str,
-    response: crate::proxy::providers::codex_oauth_auth::ManagedAuthDeviceCodeResponse,
-) -> ManagedAuthDeviceCodeResponse {
-    ManagedAuthDeviceCodeResponse {
-        provider: provider.to_string(),
-        device_code: response.device_code,
-        user_code: response.user_code,
-        verification_uri: response.verification_uri,
-        expires_in: response.expires_in,
-        interval: response.interval,
     }
 }
 
 pub struct AuthService;
 
 impl AuthService {
-    pub async fn start_login(auth_provider: &str) -> Result<ManagedAuthDeviceCodeResponse, String> {
+    /// Start the provider's native auth strategy. Browser providers return an
+    /// authorization URL; device providers return a device-code response.
+    pub async fn start(
+        auth_provider: &str,
+        redirect_uri: Option<&str>,
+    ) -> Result<AuthStartResponse, String> {
         let auth_provider = ensure_auth_provider(auth_provider)?;
         match auth_provider {
             AUTH_PROVIDER_CODEX_OAUTH => CodexOAuthService::start_device_flow()
                 .await
-                .map(|response| map_device_code_response(auth_provider, response))
+                .map(|response| {
+                    AuthStartResponse::DeviceCode(codex::map_device_code_response(
+                        auth_provider,
+                        response,
+                    ))
+                })
                 .map_err(|error| error.to_string()),
-            _ => unreachable!(),
+            AUTH_PROVIDER_CLAUDE_OAUTH => claude::manager(crate::config::get_app_config_dir())
+                .start_login(redirect_uri)
+                .await
+                .map(AuthStartResponse::Browser),
+            _ => unreachable!("validated provider must have a start strategy"),
+        }
+    }
+
+    /// Complete a browser callback for a provider that uses authorization code
+    /// OAuth. Device-code providers are completed by `poll_for_account`.
+    pub async fn complete(
+        auth_provider: &str,
+        callback_url: &str,
+    ) -> Result<AuthCompletionResponse, String> {
+        let auth_provider = ensure_auth_provider(auth_provider)?;
+        match auth_provider {
+            AUTH_PROVIDER_CLAUDE_OAUTH => {
+                claude::manager(crate::config::get_app_config_dir())
+                    .complete_login(callback_url)
+                    .await
+            }
+            AUTH_PROVIDER_CODEX_OAUTH => Err("Auth provider uses device-code polling".into()),
+            _ => unreachable!("validated provider must have a completion strategy"),
+        }
+    }
+
+    pub async fn start_login(auth_provider: &str) -> Result<ManagedAuthDeviceCodeResponse, String> {
+        match Self::start(auth_provider, None).await? {
+            AuthStartResponse::DeviceCode(response) => Ok(response),
+            AuthStartResponse::Browser(_) => Err("Auth provider uses browser callback".into()),
         }
     }
 
@@ -94,13 +138,13 @@ impl AuthService {
                     let default_account_id =
                         CodexOAuthService::get_status().await.default_account_id;
                     Ok(account.map(|account| {
-                        map_account(auth_provider, account, default_account_id.as_deref())
+                        codex::map_account(auth_provider, account, default_account_id.as_deref())
                     }))
                 }
                 Err(CodexOAuthError::AuthorizationPending) => Ok(None),
                 Err(error) => Err(error.to_string()),
             },
-            _ => unreachable!(),
+            _ => Err(unsupported(auth_provider, "device-code polling")),
         }
     }
 
@@ -114,11 +158,11 @@ impl AuthService {
                     .accounts
                     .into_iter()
                     .map(|account| {
-                        map_account(auth_provider, account, default_account_id.as_deref())
+                        codex::map_account(auth_provider, account, default_account_id.as_deref())
                     })
                     .collect())
             }
-            _ => unreachable!(),
+            _ => Err(unsupported(auth_provider, "account listing")),
         }
     }
 
@@ -137,12 +181,16 @@ impl AuthService {
                         .accounts
                         .into_iter()
                         .map(|account| {
-                            map_account(auth_provider, account, default_account_id.as_deref())
+                            codex::map_account(
+                                auth_provider,
+                                account,
+                                default_account_id.as_deref(),
+                            )
                         })
                         .collect(),
                 })
             }
-            _ => unreachable!(),
+            _ => Err(unsupported(auth_provider, "status")),
         }
     }
 
@@ -152,7 +200,7 @@ impl AuthService {
             AUTH_PROVIDER_CODEX_OAUTH => CodexOAuthService::remove_account(account_id)
                 .await
                 .map_err(|error| error.to_string()),
-            _ => unreachable!(),
+            _ => Err(unsupported(auth_provider, "account removal")),
         }
     }
 
@@ -162,7 +210,7 @@ impl AuthService {
             AUTH_PROVIDER_CODEX_OAUTH => CodexOAuthService::set_default_account(account_id)
                 .await
                 .map_err(|error| error.to_string()),
-            _ => unreachable!(),
+            _ => Err(unsupported(auth_provider, "default account selection")),
         }
     }
 
@@ -172,7 +220,7 @@ impl AuthService {
             AUTH_PROVIDER_CODEX_OAUTH => CodexOAuthService::clear_auth()
                 .await
                 .map_err(|error| error.to_string()),
-            _ => unreachable!(),
+            _ => Err(unsupported(auth_provider, "logout")),
         }
     }
 }
@@ -222,5 +270,25 @@ mod tests {
         assert_eq!(status.accounts[0].id, "acc-456");
         assert!(status.accounts[0].is_default);
         assert!(!status.accounts[1].is_default);
+    }
+
+    #[tokio::test]
+    async fn generic_start_dispatches_by_flow_type() {
+        let response = AuthService::start(AUTH_PROVIDER_CLAUDE_OAUTH, None)
+            .await
+            .expect("start browser auth");
+        let AuthStartResponse::Browser(response) = response else {
+            panic!("Claude must use the browser callback strategy");
+        };
+        assert_eq!(response.provider, AUTH_PROVIDER_CLAUDE_OAUTH);
+        assert!(response.authorization_url.starts_with("https://claude.ai/"));
+    }
+
+    #[tokio::test]
+    async fn unsupported_claude_account_operations_are_explicit_errors() {
+        let error = AuthService::get_status(AUTH_PROVIDER_CLAUDE_OAUTH)
+            .await
+            .unwrap_err();
+        assert!(error.contains("does not support status"));
     }
 }
